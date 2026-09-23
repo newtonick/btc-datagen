@@ -971,6 +971,8 @@ function renderTxSummary() {
       <tr><th>Network fee</th><td class="num">${sats(s.fee)}</td></tr>
       <tr><th>PSBT size</th><td class="num">${state.scenarioData.psbt_bytes.toLocaleString()} bytes</td></tr>
     </table>
+    ${state.scenario.summary_note
+      ? `<p class="qr-note qr-note-warn">${state.scenario.summary_note}</p>` : ''}
     <p class="qr-note">Signable, but unbroadcastable, these UTXOs do not exist.</p>`;
 }
 

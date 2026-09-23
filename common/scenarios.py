@@ -18,6 +18,8 @@ Both are built for both networks.
 from dataclasses import dataclass, field
 
 from common import script_types
+from common.attack_psbt import PR995_CLAIMED_INPUT_VALUE, PR995_REAL_INPUT_VALUE
+from common.psbt import FEE, IN_VALUE
 
 DEFAULT_NUM_INPUTS = 3
 
@@ -74,7 +76,7 @@ class Scenario:
     # `load_seed` overrides which seed the "Load the seed" step presents (the
     # point of the wrong-seed case); `expected*` describe what the device should
     # do so the sample is useful to run on hardware.
-    pr: str = None                     # "1013" | "1032" | "1044" | "1040"
+    pr: str = None                     # "1013" | "1032" | "1044" | "1040" | "995"
     attack: str = None
     load_seed: str = None
     expected: str = None
@@ -86,6 +88,10 @@ class Scenario:
     #   change  parses fine; the output is shown as change (correctly, or as a
     #           documented limit; expected_screen says which)
     outcome: str = None
+    # Free-text note rendered under the site's "What's in this transaction?"
+    # table. Only #995's amount lies need it: that table repeats the psbt's own
+    # claim, which for those is exactly the fee a vulnerable device displays.
+    summary_note: str = None
 
 
 def _make(script_type, shape, num_inputs, network, is_default=False):
@@ -177,6 +183,15 @@ TEST_PR_GROUPS = [
                   "a fingerprint. When they disagree the psbt contradicts itself and is "
                   "refused; an all-zero fingerprint is a missing value, not a second answer."),
     },
+    {
+        "pr": "995",
+        "label": "PR #995: input amounts",
+        "url": "https://github.com/seedsigner/seedsigner/pull/995",
+        "blurb": ("Fee is inputs minus outputs, so an input amount the device cannot prove "
+                  "lets a coordinator display any fee it likes. Legacy inputs are the worst "
+                  "case: their signatures commit no amount, so the lie survives signing and "
+                  "the difference burns as miner fee."),
+    },
 ]
 
 # script_type -> (short family name, wallet fixture base name), for PR #1013.
@@ -264,6 +279,7 @@ _SPEND = "Device should show the output as a payment out, not change."
 _CHANGE = "Without a descriptor the device shows it as change; load the descriptor to catch it."
 _CHANGE_OK = "Device should parse it and show the output as change."
 _CHANGE_NO_XPUBS = "With no global xpubs there is nothing to compare, so the device shows it as change."
+_UNVERIFIED = "Device should discard it: the input amounts cannot be confirmed."
 
 # Icon by outcome: a warning triangle where the device stops, an arrow where the
 # output leaves as a spend, an info mark where it is (mis)counted as change.
@@ -466,6 +482,77 @@ _PR1040_DEFS = [
                "goes unnoticed and the output is shown as change.")},
 ]
 
+# PR #995: the fee a device that trusts the forged amount displays, and the fee
+# the transaction really pays. The lie replaces one input's honest IN_VALUE with
+# PR995_CLAIMED_INPUT_VALUE while the previous transaction it ships really pays
+# PR995_REAL_INPUT_VALUE. Derived, never hardcoded, so the two cannot drift.
+_PR995_OUTPUT_TOTAL = DEFAULT_NUM_INPUTS * IN_VALUE - FEE
+_PR995_SHOWN_INPUT_TOTAL = PR995_CLAIMED_INPUT_VALUE + (DEFAULT_NUM_INPUTS - 1) * IN_VALUE
+_PR995_REAL_INPUT_TOTAL = PR995_REAL_INPUT_VALUE + (DEFAULT_NUM_INPUTS - 1) * IN_VALUE
+_PR995_SHOWN_FEE = _PR995_SHOWN_INPUT_TOTAL - _PR995_OUTPUT_TOTAL
+_PR995_REAL_FEE = _PR995_REAL_INPUT_TOTAL - _PR995_OUTPUT_TOTAL
+
+_PR995_FEE_LIE_BLURB = (
+    f"The previous transaction is genuine and really pays {PR995_REAL_INPUT_VALUE:,} "
+    f"sats for input 0, but a witness_utxo slipped in alongside it claims only "
+    f"{PR995_CLAIMED_INPUT_VALUE:,}. A device that trusts the claim shows a "
+    f"{_PR995_SHOWN_FEE:,}-sat fee while the transaction actually pays "
+    f"{_PR995_REAL_FEE:,} sats to the miner. The cross-check refuses the disagreement.")
+
+_PR995_NO_PREV_TX_BLURB = (
+    "Every input carries a witness_utxo and no previous transaction at all, so the "
+    "amounts are the coordinator's word and nothing more. A legacy sighash commits no "
+    f"amount, so the signature is still valid and the difference burns as miner fee. "
+    f"The device would show a plausible {FEE:,}-sat fee for it.")
+
+_PR995_TAMPERED_BLURB = (
+    "Input 0's previous transaction has its amount edited, so it no longer hashes to "
+    "the txid the outpoint claims to spend. Before the check nothing hashed it at all, "
+    "and the edited value was summed straight into the fee.")
+
+# The site's "What's in this transaction?" table reads the psbt's own fields, so
+# for these vectors it shows the claim, not the proven value. Spell out where
+# the claim and the truth part ways.
+_PR995_FEE_LIE_NOTE = (
+    "This table repeats the psbt's own claim, exactly what a trusting device would "
+    f"display: input 0 counts as {PR995_CLAIMED_INPUT_VALUE:,} sats. The previous "
+    f"transaction it ships really pays {PR995_REAL_INPUT_VALUE:,}, so the transaction "
+    f"actually pays {_PR995_REAL_FEE:,} sats to the miner.")
+
+_PR995_NO_PREV_TX_NOTE = (
+    "This table repeats the psbt's own claim. There is no previous transaction in the "
+    "psbt to prove any input amount, so what the inputs are really worth is not knowable "
+    "from the file.")
+
+_PR995_TAMPERED_NOTE = (
+    "This table repeats the psbt's own claim: input 0 counts the edited previous "
+    "transaction's amount. The edit changed its txid, so the previous transaction no "
+    "longer matches the outpoint it claims to spend, and neither its amount nor the "
+    "displayed fee can be trusted.")
+
+_PR995_DEFS = [
+    {"kind": "legacy_fee_lie", "script_type": "P2PKH", "family": "Legacy",
+     "label": "Forged input amount (single-sig)", "outcome": "refuse",
+     "screen": _ATTACK_SCREEN, "expected": _UNVERIFIED,
+     "blurb": _PR995_FEE_LIE_BLURB, "summary_note": _PR995_FEE_LIE_NOTE},
+    {"kind": "legacy_fee_lie_multisig", "script_type": "P2SH", "family": "Legacy multisig (2-of-3)",
+     "label": "Forged input amount (multisig)", "outcome": "refuse",
+     "screen": _ATTACK_SCREEN, "expected": _UNVERIFIED,
+     "blurb": _PR995_FEE_LIE_BLURB, "summary_note": _PR995_FEE_LIE_NOTE},
+    {"kind": "legacy_no_prev_tx", "script_type": "P2PKH", "family": "Legacy",
+     "label": "No previous transaction (single-sig)", "outcome": "refuse",
+     "screen": _ATTACK_SCREEN, "expected": _UNVERIFIED,
+     "blurb": _PR995_NO_PREV_TX_BLURB, "summary_note": _PR995_NO_PREV_TX_NOTE},
+    {"kind": "legacy_no_prev_tx_multisig", "script_type": "P2SH", "family": "Legacy multisig (2-of-3)",
+     "label": "No previous transaction (multisig)", "outcome": "refuse",
+     "screen": _ATTACK_SCREEN, "expected": _UNVERIFIED,
+     "blurb": _PR995_NO_PREV_TX_BLURB, "summary_note": _PR995_NO_PREV_TX_NOTE},
+    {"kind": "legacy_prev_tx_tampered", "script_type": "P2PKH", "family": "Legacy",
+     "label": "Previous transaction doesn't match (single-sig)", "outcome": "refuse",
+     "screen": _ATTACK_SCREEN, "expected": _UNVERIFIED,
+     "blurb": _PR995_TAMPERED_BLURB, "summary_note": _PR995_TAMPERED_NOTE},
+]
+
 
 def _make_pr_test(pr, d):
     info = script_types.get(d["script_type"])
@@ -479,6 +566,7 @@ def _make_pr_test(pr, d):
         tags=["test", d["label"], info.label],
         pr=pr, attack=d["kind"], load_seed=TEST_VICTIM_SEED,
         expected=d["expected"], expected_screen=d["screen"], outcome=d["outcome"],
+        summary_note=d.get("summary_note"),
     )
 
 
@@ -497,4 +585,6 @@ def test_scenarios() -> list:
     out.extend(_make_pr_test("1044", d) for d in _PR1044_DEFS)
     # PR #1040: the two fingerprint records for a key must agree.
     out.extend(_make_pr_test("1040", d) for d in _PR1040_DEFS)
+    # PR #995: prove each input's amount before any of them is summed.
+    out.extend(_make_pr_test("995", d) for d in _PR995_DEFS)
     return out

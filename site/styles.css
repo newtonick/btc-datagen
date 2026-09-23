@@ -219,6 +219,7 @@ main { max-width: 40rem; margin: 0 auto; padding: var(--pad); }
   color: var(--muted);
 }
 .qr-note { font-size: .9rem; color: var(--muted); margin: 6px 0 12px; }
+.qr-note-warn { color: var(--warn-text); }
 
 /* --- controls ------------------------------------------------------------ */
 .controls {

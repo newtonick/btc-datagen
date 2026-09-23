@@ -38,6 +38,7 @@ import hashlib
 from embit import bip32, script
 from embit.networks import NETWORKS
 from embit.psbt import DerivationPath
+from embit.transaction import TransactionOutput
 
 from common import script_types
 from common.psbt import (build_psbt, _path_ints, CHANGE_BRANCH, RECEIVE_BRANCH)
@@ -709,6 +710,97 @@ def _pr1044_decoy_substituted(signers, network, num_inputs, threshold):
     return psbt
 
 
+# --- PR #995: prove each input's amount before displaying the fee ------------
+#
+# fee = inputs - outputs, so a coordinator that lies about an input's amount can
+# make the device display any fee it likes. Legacy inputs are the worst case:
+# their signatures commit to no amount at all, so the lie survives signing and
+# the difference is handed to the miner in a single session. #995's
+# _verify_input_amounts() closes three deceptions:
+#
+#   PSBTInputAmountVerificationError -> PSBTInputAmountVerificationFailedView
+#       A non_witness_utxo is the whole previous transaction, so it is hashed
+#       against the outpoint it claims to spend; a legacy (or unrecognized)
+#       input must supply one, because its sighash commits no amount; and a
+#       witness_utxo sitting alongside a proven non_witness_utxo must agree
+#       with it, because embit's InputScope.utxo and PSBT.fee() prefer the
+#       witness_utxo and would otherwise display the unproven value.
+#
+# The fixtures' legacy inputs carry non_witness_utxo only (common/psbt.py), so
+# each forgery adds or edits exactly the field a coordinator controls. Throwaway
+# keys only; nothing here is broadcastable.
+
+# The lie's two amounts: the previous transaction really pays the first, while
+# the witness_utxo claims the second. The gap is what burns as miner fee.
+PR995_REAL_INPUT_VALUE = 5_000_000
+PR995_CLAIMED_INPUT_VALUE = 100_000
+
+
+def _pr995_relink_prevout(psbt, idx: int, real_value: int):
+    """Revalue input idx's funding transaction and point the outpoint at the
+    result, so a genuine (hash-valid) previous transaction really pays
+    `real_value` while the input still claims the builder's 100,000."""
+    inp = psbt.inputs[idx]
+    prev = inp.non_witness_utxo
+    prev.vout[0].value = real_value
+    inp.txid = prev.txid()
+
+
+def _pr995_fee_lie(signers, script_type: str, num_inputs: int, threshold=None):
+    psbt = build_psbt(signers, script_type, num_inputs, "change", threshold=threshold)
+    _pr995_relink_prevout(psbt, 0, PR995_REAL_INPUT_VALUE)
+    spk = psbt.inputs[0].non_witness_utxo.vout[0].script_pubkey
+    psbt.inputs[0].witness_utxo = TransactionOutput(PR995_CLAIMED_INPUT_VALUE, spk)
+    return psbt
+
+
+def _pr995_fee_lie_p2pkh(signers, network, num_inputs):
+    """A genuine previous transaction paired with a lying witness_utxo.
+
+    The non_witness_utxo really is the transaction the outpoint spends, so
+    embit's verify() passes; but embit's PSBT.fee() prefers the witness_utxo,
+    so the device would display the claim. Here the previous transaction pays
+    5,000,000 sats while the witness_utxo claims 100,000: a device that trusts
+    the claim shows a 10,000-sat fee on a transaction that really pays 4,910,000
+    sats to the miner. The cross-check refuses the disagreement.
+    """
+    return _pr995_fee_lie(signers, "P2PKH", num_inputs)
+
+
+def _pr995_fee_lie_p2sh(signers, network, num_inputs, threshold):
+    """The 2-of-3 legacy multisig version of the lying witness_utxo."""
+    return _pr995_fee_lie(signers, "P2SH", num_inputs, threshold)
+
+
+def _pr995_no_prev_tx(signers, script_type: str, num_inputs: int, threshold=None):
+    """Every input carries a witness_utxo and no non_witness_utxo at all: the
+    amounts rest on the coordinator's word alone, yet the legacy sighash still
+    yields a valid signature over them, so the difference burns as miner fee."""
+    psbt = build_psbt(signers, script_type, num_inputs, "change", threshold=threshold)
+    for inp in psbt.inputs:
+        prevout = inp.non_witness_utxo.vout[0]
+        inp.witness_utxo = TransactionOutput(prevout.value, prevout.script_pubkey)
+        inp.non_witness_utxo = None
+    return psbt
+
+
+def _pr995_no_prev_tx_p2pkh(signers, network, num_inputs):
+    return _pr995_no_prev_tx(signers, "P2PKH", num_inputs)
+
+
+def _pr995_no_prev_tx_p2sh(signers, network, num_inputs, threshold):
+    return _pr995_no_prev_tx(signers, "P2SH", num_inputs, threshold)
+
+
+def _pr995_prev_tx_tampered(signers, network, num_inputs):
+    """The previous transaction's amount is edited, so it no longer hashes to
+    the txid the outpoint claims to spend. Before #995 nothing hashed it at all
+    and the edited value was summed straight into the fee."""
+    psbt = build_psbt(signers, "P2PKH", num_inputs, "change")
+    psbt.inputs[0].non_witness_utxo.vout[0].value += 100_000
+    return psbt
+
+
 # --- PR #1040: reject a psbt whose fingerprint records disagree --------------
 #
 # A psbt makes two claims about where a key comes from: the fingerprint on the
@@ -835,6 +927,11 @@ _TEST_BUILDERS = {
     "cosigner_mismatch_no_xpubs": _pr1040_cosigner_mismatch_no_xpubs,
     "singlesig_xpub_mismatch": _pr1040_singlesig_xpub_mismatch,
     "mismatch_beneath_contradiction": _pr1040_mismatch_beneath_contradiction,
+    "legacy_fee_lie": _pr995_fee_lie_p2pkh,
+    "legacy_fee_lie_multisig": _pr995_fee_lie_p2sh,
+    "legacy_no_prev_tx": _pr995_no_prev_tx_p2pkh,
+    "legacy_no_prev_tx_multisig": _pr995_no_prev_tx_p2sh,
+    "legacy_prev_tx_tampered": _pr995_prev_tx_tampered,
 }
 
 # Kinds that need the wallet threshold passed through (multisig builders).
@@ -846,14 +943,15 @@ _MULTISIG_KINDS = {"contradiction_multisig", "contradiction_multisig_unclaimed",
                    "diff_quorum_no_xpubs",
                    "decoy_last", "decoy_substituted",
                    "cosigner_mismatch", "cosigner_mismatch_input", "cosigner_missing",
-                   "cosigner_mismatch_no_xpubs", "mismatch_beneath_contradiction"}
+                   "cosigner_mismatch_no_xpubs", "mismatch_beneath_contradiction",
+                   "legacy_fee_lie_multisig", "legacy_no_prev_tx_multisig"}
 
 
 def build_test_psbt(kind: str, signers: list, script_type: str,
                     network: str = "main", num_inputs: int = 3, threshold: int = None):
     """The PSBT for one test scenario, by its `attack` kind. Covers every PR:
     #1013's two forgeries and its honest wrong-seed psbt, then the per-output
-    builders for #1032, #1044, and #1040."""
+    builders for #1032, #1044, and #1040, and #995's legacy input-amount lies."""
     if kind in ("fake_change", "bad_input"):
         return build_attack_psbt(kind, signers, script_type, network, num_inputs, threshold)
     if kind == "wrong_seed":
